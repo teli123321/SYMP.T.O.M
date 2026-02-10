@@ -1,6 +1,14 @@
 import streamlit as st
 from openai import OpenAI
-import time
+
+# Vérifie que le secret est bien lu
+if "openai" not in st.secrets or "api_key" not in st.secrets["openai"]:
+    st.error("❌ Clé OpenAI introuvable ! Vérifie tes secrets Streamlit.")
+    st.stop()
+
+# Initialise le client OpenAI avec la clé du secret
+client = OpenAI(api_key=st.secrets["openai"]["api_key"])
+
 
 st.set_page_config(page_title="SYMP.T.O.M", layout="wide")
 
@@ -13,7 +21,11 @@ DEFAULT_BOT_BUBBLE = "#ffffff"
 DEFAULT_BOT_TEXT = "#000000"
 
 # ================= IA =================
-client = OpenAI()
+import streamlit as st
+from openai import OpenAI
+
+# Crée le client OpenAI en utilisant la clé stockée sur Streamlit Cloud
+client = OpenAI(api_key=st.secrets["openai"]["api_key"])
 TEMPERATURE = 0.3
 
 SOURCES_AUTORISEES = {
