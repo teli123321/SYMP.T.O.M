@@ -1,5 +1,6 @@
 import streamlit as st
 from openai import OpenAI
+import time
 
 # Vérifie que le secret est bien lu
 if "openai" not in st.secrets or "api_key" not in st.secrets["openai"]:
