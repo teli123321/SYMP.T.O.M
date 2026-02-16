@@ -1,34 +1,22 @@
+import os
 import streamlit as st
 from openai import OpenAI
+import requests
+from bs4 import BeautifulSoup
 import time
 
-# Vérifie que le secret est bien lu
-if "openai" not in st.secrets or "api_key" not in st.secrets["openai"]:
-    st.error("❌ Clé OpenAI introuvable ! Vérifie tes secrets Streamlit.")
+# ================= CONFIG =================
+st.set_page_config(page_title="SYMP.T.O.M", layout="centered")
+
+api_key = os.environ.get("OPENAI_API_KEY")
+if not api_key:
+    st.error("Clé OpenAI introuvable.")
     st.stop()
 
-# Initialise le client OpenAI avec la clé du secret
-client = OpenAI(api_key=st.secrets["openai"]["api_key"])
-
-
-st.set_page_config(page_title="SYMP.T.O.M", layout="wide")
-
-# ================= COULEURS FIXES =================
-DEFAULT_BG = "#f9f9f9"
-DEFAULT_SIDEBAR = "#1e4ed8"
-DEFAULT_USER_BUBBLE = "#ff7aa2"
-DEFAULT_USER_TEXT = "#ffffff"
-DEFAULT_BOT_BUBBLE = "#ffffff"
-DEFAULT_BOT_TEXT = "#000000"
-
-# ================= IA =================
-import streamlit as st
-from openai import OpenAI
-
-# Crée le client OpenAI en utilisant la clé stockée sur Streamlit Cloud
-client = OpenAI(api_key=st.secrets["openai"]["api_key"])
+client = OpenAI(api_key=api_key)
 TEMPERATURE = 0.3
 
+# ================= SOURCES =================
 SOURCES_AUTORISEES = {
     "Mayo Clinic": "https://www.mayoclinic.org/diseases-conditions",
     "NHS": "https://www.nhs.uk/conditions/",
@@ -36,143 +24,142 @@ SOURCES_AUTORISEES = {
     "Johns Hopkins": "https://www.hopkinsmedicine.org/health"
 }
 
-SYSTEM_PROMPT = f"""
+# ================= FONCTIONS =================
+def fetch_content_from_url(url):
+    """Récupère le texte du site si possible"""
+    if url not in SOURCES_AUTORISEES.values():
+        return ""
+    try:
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp = requests.get(url, headers=headers, timeout=5)
+        resp.raise_for_status()
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for script in soup(["script", "style"]):
+            script.extract()
+        return soup.get_text(separator="\n")[:3000]  # limiter pour l'IA
+    except:
+        return ""
+
+def choisir_source(question):
+    q = question.lower()
+    if "covid" in q or "virus" in q or "pandemic" in q:
+        return SOURCES_AUTORISEES.get("WHO") or next(iter(SOURCES_AUTORISEES.values()))
+    elif "cancer" in q or "diabetes" in q or "disease" in q:
+        return SOURCES_AUTORISEES.get("Mayo Clinic") or next(iter(SOURCES_AUTORISEES.values()))
+    elif "symptom" in q or "treatment" in q or "illness" in q:
+        return SOURCES_AUTORISEES.get("NHS") or next(iter(SOURCES_AUTORISEES.values()))
+    else:
+        return next(iter(SOURCES_AUTORISEES.values()))
+
+SYSTEM_PROMPT = """
 Tu es un assistant médical pédagogique pour le grand public.
 Tu n'es PAS un médecin.
 
-RÈGLE ABSOLUE :
-- Répond UNIQUEMENT aux questions liées à la santé.
-- Ne pose qu'UNE SEULE question de clarification à la fois.
-- Après chaque réponse de l'utilisateur, attends sa réponse avant de poser la prochaine question.
-- Si une question est de type Yes/No, attends que l'utilisateur réponde Oui ou Non.
-- Cite toujours les sources : {list(SOURCES_AUTORISEES.keys())}.
+RÈGLE :
+- Répond uniquement aux questions liées à la santé.
+- Cite toujours la source utilisée.
 - Forme polie et rassurante.
 - Ne conserve aucune donnée personnelle.
 """
 
-# ================= MÉMOIRE =================
+# ================= STATE =================
+if "screen" not in st.session_state:
+    st.session_state.screen = "welcome"
+
 if "conversation" not in st.session_state:
     st.session_state.conversation = [{"role":"system","content":SYSTEM_PROMPT}]
-if "consent" not in st.session_state:
-    st.session_state.consent = False
-if "last_question_type" not in st.session_state:
-    st.session_state.last_question_type = "text"  # "text" ou "yesno"
-if "last_yesno_question" not in st.session_state:
-    st.session_state.last_yesno_question = ""
+if "conversation_for_ia" not in st.session_state:
+    st.session_state.conversation_for_ia = [{"role":"system","content":SYSTEM_PROMPT}]
 
 # ================= IA FUNCTION =================
-def demander_ia(q, yesno_response=False):
-    """
-    q : texte à envoyer à l'IA
-    yesno_response : si True, on envoie la réponse Oui/Non à la question YesNo précédente
-    """
-    if yesno_response:
-        # On reformule la réponse pour que l'IA sache à quelle question ça correspond
-        full_message = f"Question: {st.session_state.last_yesno_question}\nRéponse: {q}"
-    else:
-        full_message = q
+def demander_ia(message):
+    url = choisir_source(message)
+    contenu = fetch_content_from_url(url)
 
-    st.session_state.conversation.append({"role":"user","content":full_message})
+    # --- Ajouter uniquement la question pour l'utilisateur ---
+    st.session_state.conversation.append({"role": "user", "content": message})
 
+    # --- Ajouter le message interne pour l'IA ---
+    internal_message = f"Question utilisateur: {message}\nContenu de la source ({url}):\n{contenu}"
+    st.session_state.conversation_for_ia.append({"role": "user", "content": internal_message})
+
+    # --- Appel à l'IA ---
     with st.spinner("🤔 SYMP.T.O.M réfléchit..."):
         time.sleep(1)
-        r = client.chat.completions.create(
+        resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=st.session_state.conversation,
+            messages=st.session_state.conversation_for_ia,
             temperature=TEMPERATURE
         )
 
-    rep = r.choices[0].message.content
-    st.session_state.conversation.append({"role":"assistant","content":rep})
+    reply = resp.choices[0].message.content
+    reply_with_source = f"{reply}\n\n(Source : {next((k for k,v in SOURCES_AUTORISEES.items() if v==url), 'Source inconnue')})"
+    st.session_state.conversation.append({"role":"assistant","content":reply_with_source})
 
-    # Détection simple de question Yes/No (1 question à la fois)
-    lower_rep = rep.lower()
-    if any(keyword in lower_rep for keyword in ["oui ?", "non ?", "as-tu", "ressens-tu", "avez-vous"]):
-        st.session_state.last_question_type = "yesno"
-        st.session_state.last_yesno_question = rep
-    else:
-        st.session_state.last_question_type = "text"
-        st.session_state.last_yesno_question = ""
+# ================= STYLE =================
+st.markdown("""
+<style>
+body { background: linear-gradient(135deg, #4facfe, #43e97b); padding-top:0px !important; }
+.main-container { display:flex; justify-content:center; align-items:center; height:85vh; }
+.card { background:white; padding:40px; border-radius:30px; box-shadow:0 15px 40px rgba(0,0,0,0.15); width:420px; text-align:center; }
+.big-title { font-size:28px; font-weight:600; margin-bottom:15px; }
+.subtitle { color:#666; margin-bottom:30px; }
+.stButton>button { background: linear-gradient(90deg, #4facfe, #43e97b); color:white; border:none; border-radius:25px; padding:10px 25px; font-size:16px; }
+</style>
+""", unsafe_allow_html=True)
 
-# ================= CONSENT SCREEN =================
-if not st.session_state.consent:
+# ================= SCREENS =================
+if st.session_state.screen == "welcome":
+    st.markdown('<div class="main-container"><div class="card">', unsafe_allow_html=True)
+    st.markdown("<div style='font-size:50px;'>🤖</div>", unsafe_allow_html=True)
+    st.markdown('<div class="big-title">SYMP.T.O.M</div>', unsafe_allow_html=True)
     st.markdown("""
-    ⚠️ **Consentement**
-    Ce programme est un outil informatique.  
-    Il ne remplace pas un médecin.
-    """)
-    if st.button("J'ai compris et je consens"):
-        st.session_state.consent = True
-        st.rerun()
-else:
-    # ================= CSS FIXE =================
-    st.markdown(f"""
-    <style>
-    body {{ background-color: {DEFAULT_BG}; }}
-    [data-testid="stSidebar"] {{ background: {DEFAULT_SIDEBAR}; }}
-    .user-bubble {{
-        background:{DEFAULT_USER_BUBBLE};
-        color:{DEFAULT_USER_TEXT};
-        padding:12px;
-        border-radius:20px;
-        margin:10px;
-        max-width:60%;
-        margin-left:auto;
-    }}
-    .bot-bubble {{
-        background:{DEFAULT_BOT_BUBBLE};
-        color:{DEFAULT_BOT_TEXT};
-        padding:12px;
-        border-radius:20px;
-        margin:10px;
-        max-width:60%;
-        box-shadow:0px 4px 10px rgba(0,0,0,0.05);
-    }}
-    .stTextInput>div>div>input {{
-        border-radius:20px;
-        padding:12px;
-    }}
-    </style>
+    <div class="subtitle">
+    Assistant pédagogique en santé.<br>
+    Je vous aide à comprendre vos symptômes<br>
+    à partir de sources médicales fiables.
+    </div>
     """, unsafe_allow_html=True)
+    if st.button("Commencer la consultation"):
+        st.session_state.screen = "consent"
+        st.rerun()
+    st.markdown('</div></div>', unsafe_allow_html=True)
 
-    # ================= LAYOUT =================
-    col1, col2 = st.columns([1,4])
-
+elif st.session_state.screen == "consent":
+    st.markdown('<div class="main-container"><div class="card">', unsafe_allow_html=True)
+    st.markdown('<div class="big-title">⚠️ Consentement</div>', unsafe_allow_html=True)
+    st.markdown("""
+    <div class="subtitle">
+    Cet outil ne remplace pas un médecin.<br>
+    Il fournit des informations éducatives uniquement.
+    </div>
+    """, unsafe_allow_html=True)
+    col1, col2 = st.columns(2)
     with col1:
-        st.image("https://static.vecteezy.com/system/resources/previews/037/761/852/non_2x/cute-pink-robot-with-buttons-vector.jpg", width=150)
-        st.write("## SYMP.T.O.M")
-
+        if st.button("Retour"):
+            st.session_state.screen = "welcome"
+            st.rerun()
     with col2:
-        st.title("🧠 SYMP.T.O.M Assistant Médical")
+        if st.button("J'accepte"):
+            st.session_state.screen = "chat"
+            st.rerun()
+    st.markdown('</div></div>', unsafe_allow_html=True)
 
+elif st.session_state.screen == "chat":
+    st.markdown("## 🧠 SYMP.T.O.M")
+    chat_container = st.container()
+    with chat_container:
         for msg in st.session_state.conversation:
             if msg["role"]=="user":
-                st.markdown(f"<div class='user-bubble'>🤒 : {msg['content']}</div>", unsafe_allow_html=True)
+                st.markdown(f"**Vous :** {msg['content']}")
             elif msg["role"]=="assistant":
-                st.markdown(f"<div class='bot-bubble'>🤖 {msg['content']}</div>", unsafe_allow_html=True)
-
-        # INPUT OU BOUTONS YES/NO
-        if st.session_state.last_question_type == "text":
-            with st.form("chat_form", clear_on_submit=True):
-                user_input = st.text_input("Message")
-                send = st.form_submit_button("Envoyer")
-            if send and user_input:
-                demander_ia(user_input)
-                st.rerun()
-        else:
-            col_yes, col_no = st.columns(2)
-            with col_yes:
-                if st.button("✅ Oui"):
-                    demander_ia("Oui", yesno_response=True)
-                    st.rerun()
-            with col_no:
-                if st.button("❌ Non"):
-                    demander_ia("Non", yesno_response=True)
-                    st.rerun()
-
-        # DELETE BUTTON
-        if st.button("🧨 Supprimer la conversation"):
-            st.session_state.conversation = [{"role":"system","content":SYSTEM_PROMPT}]
-            st.session_state.last_question_type = "text"
-            st.session_state.last_yesno_question = ""
-            st.rerun()
+                st.markdown(f"**SYMP.T.O.M :** {msg['content']}")
+    user_input = st.text_input("Votre message")
+    if st.button("Envoyer") and user_input:
+        demander_ia(user_input)
+        st.rerun()
+    if st.button("Retour à l'accueil"):
+        st.session_state.screen = "welcome"
+        st.session_state.conversation = [{"role":"system","content":SYSTEM_PROMPT}]
+        st.session_state.conversation_for_ia = [{"role":"system","content":SYSTEM_PROMPT}]
+        st.rerun()
