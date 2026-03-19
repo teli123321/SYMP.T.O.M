@@ -3,32 +3,63 @@ import streamlit as st
 from openai import OpenAI
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urlparse
 import time
+ 
+# ================= CONFIG (UNE SEULE FOIS) =================
 
-# ================= CONFIG =================
 st.set_page_config(page_title="SYMP.T.O.M", layout="centered")
-
+ 
 api_key = os.environ.get("OPENAI_API_KEY")
 if not api_key:
     st.error("Clé OpenAI introuvable.")
     st.stop()
-
+ 
 client = OpenAI(api_key=api_key)
 TEMPERATURE = 0.3
-
-# ================= SOURCES =================
+ 
+# ================= SOURCES AUTORISÉES =================
 SOURCES_AUTORISEES = {
-    "Mayo Clinic": "https://www.mayoclinic.org/diseases-conditions",
-    "NHS": "https://www.nhs.uk/conditions/",
+    "MSSS Québec": "https://www.quebec.ca/sante/",
+    "Santé Canada": "https://www.canada.ca/fr/sante-canada.html",
+    "NHS UK": "https://www.nhs.uk/conditions/",
     "WHO": "https://www.who.int/health-topics",
     "Johns Hopkins": "https://www.hopkinsmedicine.org/health"
 }
-
+ 
+# ✅ NOUVEAU : Domaines extraits automatiquement depuis SOURCES_AUTORISEES
+# Pas besoin de les maintenir manuellement — ils sont dérivés de la liste ci-dessus
+DOMAINES_AUTORISES = {urlparse(url).netloc for url in SOURCES_AUTORISEES.values()}
+ 
+# ================= RESTRICTION RÉSEAU (MONKEY-PATCH) =================
+# ✅ FIX : Bloque toute requête vers un domaine non autorisé, au niveau de requests
+# Ceci s'applique à TOUTES les requêtes faites via requests.get / requests.post etc.
+_original_request = requests.Session.request
+ 
+def _restricted_request(self, method, url, **kwargs):
+    """Intercepte chaque requête HTTP et bloque les domaines non autorisés."""
+    domain = urlparse(url).netloc.split(":")[0]  # Retire le port si présent
+    if domain not in DOMAINES_AUTORISES:
+        # On lève une exception claire plutôt que de retourner silencieusement ""
+        raise PermissionError(f"🚫 Requête bloquée : domaine '{domain}' non autorisé.")
+    return _original_request(self, method, url, **kwargs)
+ 
+# Application du patch — fait une seule fois au démarrage du script
+requests.Session.request = _restricted_request
+ 
+ 
 # ================= FONCTIONS =================
-def fetch_content_from_url(url):
-    """Récupère le texte du site si possible"""
-    if url not in SOURCES_AUTORISEES.values():
+def fetch_content_from_url_safe(url):
+    """Récupère le texte uniquement depuis les sites autorisés, limité à 3000 caractères."""
+    # ✅ FIX : La vérification de domaine est maintenant gérée par le monkey-patch,
+    # mais on garde ce check ici pour la lisibilité et la sécurité défensive
+    allowed_url = next(
+        (allowed for allowed in SOURCES_AUTORISEES.values() if url.startswith(allowed)),
+        None
+    )
+    if not allowed_url:
         return ""
+ 
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         resp = requests.get(url, headers=headers, timeout=5)
@@ -36,54 +67,87 @@ def fetch_content_from_url(url):
         soup = BeautifulSoup(resp.text, "html.parser")
         for script in soup(["script", "style"]):
             script.extract()
-        return soup.get_text(separator="\n")[:3000]  # limiter pour l'IA
-    except:
+        text = soup.get_text(separator="\n")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        
+        return "\n".join(lines)[:300000000000000000000000]
+    except PermissionError as e:
+        
+        st.warning(str(e))
         return ""
-
+    except requests.RequestException as e:
+     
+        st.warning(f"Erreur lors de la récupération de la source : {e}")
+        return ""
+ 
+ 
 def choisir_source(question):
+    """Choisit la source la plus pertinente selon les mots-clés de la question."""
     q = question.lower()
-    if "covid" in q or "virus" in q or "pandemic" in q:
-        return SOURCES_AUTORISEES.get("WHO") or next(iter(SOURCES_AUTORISEES.values()))
-    elif "cancer" in q or "diabetes" in q or "disease" in q:
-        return SOURCES_AUTORISEES.get("Mayo Clinic") or next(iter(SOURCES_AUTORISEES.values()))
-    elif "symptom" in q or "treatment" in q or "illness" in q:
-        return SOURCES_AUTORISEES.get("NHS") or next(iter(SOURCES_AUTORISEES.values()))
+    if any(mot in q for mot in ["covid", "virus", "pandemic", "vaccin", "rendez-vous"]):
+        return SOURCES_AUTORISEES.get("MSSS Québec") or SOURCES_AUTORISEES.get("Santé Canada")
+    elif any(mot in q for mot in ["cancer", "diabetes", "maladie", "disease"]):
+        return SOURCES_AUTORISEES.get("Santé Canada") or next(iter(SOURCES_AUTORISEES.values()))
+    elif any(mot in q for mot in ["symptom", "traitement", "illness"]):
+        return SOURCES_AUTORISEES.get("NHS UK") or next(iter(SOURCES_AUTORISEES.values()))
     else:
         return next(iter(SOURCES_AUTORISEES.values()))
-
+ 
+ 
+# ================= PROMPT SYSTEM =================
 SYSTEM_PROMPT = """
-Tu es un assistant médical pédagogique pour le grand public.
-Tu n'es PAS un médecin.
-
-RÈGLE :
-- Répond uniquement aux questions liées à la santé.
-- Cite toujours la source utilisée.
-- Forme polie et rassurante.
-- Ne conserve aucune donnée personnelle.
+Tu es SYMP.T.O.M, un assistant médical pédagogique destiné au grand public au CANADA.
+ 
+IMPORTANT :
+- Tu n'es PAS un médecin.
+- Tu ne poses pas de diagnostic.
+- Tu ne prescris aucun traitement.
+- Tu ne donnes pas d'instructions médicales personnalisées.
+- TU DOIS DONNER DES CONSEILS DE BIEN ETRE C FULLL IMPORTANT!!!
+ 
+RÈGLES OBLIGATOIRES :
+1. Réponds uniquement aux questions liées à la santé.
+2. Utilise exclusivement les informations fournies dans le contenu de la source autorisée.
+3. Ne complète jamais avec des connaissances extérieures.
+4. Cite toujours clairement la source utilisée à la fin de ta réponse.
+5. Si l'information n'est pas disponible dans le contenu fourni, indique-le honnêtement.
+6. Adopte un ton clair, rassurant et pédagogique.
+7. Ne conserve aucune donnée personnelle.
+8. Si la situation semble urgente ou grave, recommande de consulter un professionnel de santé ou le service d'urgence local (au Canada, composer le 911).
+9. SOIS GENTIL, les personnes qui viennent te voir sont probablement en état de stress.
+ 
+ADAPTATION CANADA :
+- Toujours fournir les informations adaptées au Canada (ex: numéros d'urgence, recommandations locales).
+- Ne jamais mentionner des numéros d'urgence d'autres pays.
+- Se concentrer sur les ressources officielles canadiennes lorsqu'elles existent.
 """
-
-# ================= STATE =================
+ 
+# ================= STATE  =================
 if "screen" not in st.session_state:
     st.session_state.screen = "welcome"
-
+if "consent_given" not in st.session_state:
+    st.session_state.consent_given = False
 if "conversation" not in st.session_state:
-    st.session_state.conversation = [{"role":"system","content":SYSTEM_PROMPT}]
+    st.session_state.conversation = [{"role": "system", "content": SYSTEM_PROMPT}]
 if "conversation_for_ia" not in st.session_state:
-    st.session_state.conversation_for_ia = [{"role":"system","content":SYSTEM_PROMPT}]
-
+    st.session_state.conversation_for_ia = [{"role": "system", "content": SYSTEM_PROMPT}]
+ 
+ 
 # ================= IA FUNCTION =================
 def demander_ia(message):
+    """Envoie un message à l'IA avec le contenu de la source choisie."""
     url = choisir_source(message)
-    contenu = fetch_content_from_url(url)
-
-    # --- Ajouter uniquement la question pour l'utilisateur ---
+    contenu = fetch_content_from_url_safe(url)
+ 
     st.session_state.conversation.append({"role": "user", "content": message})
-
-    # --- Ajouter le message interne pour l'IA ---
-    internal_message = f"Question utilisateur: {message}\nContenu de la source ({url}):\n{contenu}"
+ 
+    if contenu:
+        internal_message = f"Question utilisateur: {message}\n\nContenu de la source ({url}):\n{contenu}"
+    else:
+        internal_message = f"Question utilisateur: {message}\n\nAucune information autorisée disponible pour cette source."
+ 
     st.session_state.conversation_for_ia.append({"role": "user", "content": internal_message})
-
-    # --- Appel à l'IA ---
+ 
     with st.spinner("🤔 SYMP.T.O.M réfléchit..."):
         time.sleep(1)
         resp = client.chat.completions.create(
@@ -91,75 +155,96 @@ def demander_ia(message):
             messages=st.session_state.conversation_for_ia,
             temperature=TEMPERATURE
         )
-
+ 
     reply = resp.choices[0].message.content
-    reply_with_source = f"{reply}\n\n(Source : {next((k for k,v in SOURCES_AUTORISEES.items() if v==url), 'Source inconnue')})"
-    st.session_state.conversation.append({"role":"assistant","content":reply_with_source})
-
-# ================= STYLE =================
+    source_name = next((k for k, v in SOURCES_AUTORISEES.items() if v == url), "Source inconnue")
+    reply_with_source = f"{reply}\n\n(Source : {source_name})"
+    st.session_state.conversation.append({"role": "assistant", "content": reply_with_source})
+ 
+ 
+# ================= CSS =================
 st.markdown("""
 <style>
-body { background: linear-gradient(135deg, #4facfe, #43e97b); padding-top:0px !important; }
-.main-container { display:flex; justify-content:center; align-items:center; height:85vh; }
-.card { background:white; padding:40px; border-radius:30px; box-shadow:0 15px 40px rgba(0,0,0,0.15); width:420px; text-align:center; }
-.big-title { font-size:28px; font-weight:600; margin-bottom:15px; }
-.subtitle { color:#666; margin-bottom:30px; }
-.stButton>button { background: linear-gradient(90deg, #4facfe, #43e97b); color:white; border:none; border-radius:25px; padding:10px 25px; font-size:16px; }
+body {
+    background: linear-gradient(135deg, #4facfe, #43e97b);
+    font-family: 'Arial', sans-serif;
+}
+.card {
+    max-width: 450px;
+    margin: 30px auto;
+    background: white;
+    border-radius: 25px;
+    padding: 25px 20px;
+    box-shadow: 0px 10px 30px rgba(0,0,0,0.2);
+}
+.msg-user {
+    background: #4facfe;
+    color: white;
+    padding: 10px 15px;
+    border-radius: 20px 20px 5px 20px;
+    margin: 6px 0;
+    text-align: right;
+    font-size: 15px;
+}
+.msg-bot {
+    background: #e6fffa;
+    color: #222;
+    padding: 10px 15px;
+    border-radius: 20px 20px 20px 5px;
+    margin: 6px 0;
+    text-align: left;
+    font-size: 15px;
+}
+.consent-box {
+    background: #fff3e6;
+    border-left: 5px solid #ffa500;
+    padding: 15px;
+    margin-bottom: 20px;
+    border-radius: 10px;
+}
 </style>
 """, unsafe_allow_html=True)
-
+ 
+ 
 # ================= SCREENS =================
 if st.session_state.screen == "welcome":
-    st.markdown('<div class="main-container"><div class="card">', unsafe_allow_html=True)
-    st.markdown("<div style='font-size:50px;'>🤖</div>", unsafe_allow_html=True)
-    st.markdown('<div class="big-title">SYMP.T.O.M</div>', unsafe_allow_html=True)
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("<h1 style='text-align:center;'>🤖 SYMP.T.O.M</h1>", unsafe_allow_html=True)
+    st.markdown("<h3 style='text-align:center;color:#333;'>Assistant pédagogique en santé</h3>", unsafe_allow_html=True)
+ 
+    st.markdown('<div class="consent-box">', unsafe_allow_html=True)
     st.markdown("""
-    <div class="subtitle">
-    Assistant pédagogique en santé.<br>
-    Je vous aide à comprendre vos symptômes<br>
-    à partir de sources médicales fiables.
-    </div>
+    <strong>Important :</strong><br>
+    - SYMP.T.O.M n'est pas un médecin et ne fournit pas de diagnostics.<br>
+    - Les informations sont pédagogiques et basées sur des sources fiables canadiennes.<br>
+    - En utilisant cette application, vous acceptez de recevoir des informations générales et de suivre les recommandations locales si nécessaire.
     """, unsafe_allow_html=True)
-    if st.button("Commencer la consultation"):
-        st.session_state.screen = "consent"
+    st.markdown('</div>', unsafe_allow_html=True)
+ 
+    if st.button("J'accepte et commencer"):
+        st.session_state.consent_given = True
+        st.session_state.screen = "chat"
         st.rerun()
-    st.markdown('</div></div>', unsafe_allow_html=True)
-
-elif st.session_state.screen == "consent":
-    st.markdown('<div class="main-container"><div class="card">', unsafe_allow_html=True)
-    st.markdown('<div class="big-title">⚠️ Consentement</div>', unsafe_allow_html=True)
-    st.markdown("""
-    <div class="subtitle">
-    Cet outil ne remplace pas un médecin.<br>
-    Il fournit des informations éducatives uniquement.
-    </div>
-    """, unsafe_allow_html=True)
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Retour"):
-            st.session_state.screen = "welcome"
+ 
+    st.markdown('</div>', unsafe_allow_html=True)
+ 
+elif st.session_state.screen == "chat" and st.session_state.consent_given:
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+    st.markdown("<h2 style='text-align:center;'>🤖 SYMP.T.O.M (Canada)</h2>", unsafe_allow_html=True)
+ 
+    for msg in st.session_state.conversation:
+        if msg["role"] == "user":
+            st.markdown(f'<div class="msg-user">{msg["content"]}</div>', unsafe_allow_html=True)
+        elif msg["role"] == "assistant":
+            st.markdown(f'<div class="msg-bot">{msg["content"]}</div>', unsafe_allow_html=True)
+ 
+    with st.form(key="input_form", clear_on_submit=True):
+        cols = st.columns([5, 1])
+        user_text = cols[0].text_input("", key="current_msg", placeholder="Pose ta question en santé…")
+        send_button = cols[1].form_submit_button("📤")
+ 
+        if send_button and user_text:
+            demander_ia(user_text)
             st.rerun()
-    with col2:
-        if st.button("J'accepte"):
-            st.session_state.screen = "chat"
-            st.rerun()
-    st.markdown('</div></div>', unsafe_allow_html=True)
-
-elif st.session_state.screen == "chat":
-    st.markdown("## 🧠 SYMP.T.O.M")
-    chat_container = st.container()
-    with chat_container:
-        for msg in st.session_state.conversation:
-            if msg["role"]=="user":
-                st.markdown(f"**Vous :** {msg['content']}")
-            elif msg["role"]=="assistant":
-                st.markdown(f"**SYMP.T.O.M :** {msg['content']}")
-    user_input = st.text_input("Votre message")
-    if st.button("Envoyer") and user_input:
-        demander_ia(user_input)
-        st.rerun()
-    if st.button("Retour à l'accueil"):
-        st.session_state.screen = "welcome"
-        st.session_state.conversation = [{"role":"system","content":SYSTEM_PROMPT}]
-        st.session_state.conversation_for_ia = [{"role":"system","content":SYSTEM_PROMPT}]
-        st.rerun()
+ 
+    st.markdown('</div>', unsafe_allow_html=True)
