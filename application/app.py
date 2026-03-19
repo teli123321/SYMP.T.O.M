@@ -6,7 +6,7 @@ from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 import time
  
-# ================= CONFIG (UNE SEULE FOIS) =================
+# ================= CONFIG =================
 
 st.set_page_config(page_title="SYMP.T.O.M", layout="centered")
  
@@ -27,20 +27,16 @@ SOURCES_AUTORISEES = {
     "Johns Hopkins": "https://www.hopkinsmedicine.org/health"
 }
  
-# ✅ NOUVEAU : Domaines extraits automatiquement depuis SOURCES_AUTORISEES
-# Pas besoin de les maintenir manuellement — ils sont dérivés de la liste ci-dessus
 DOMAINES_AUTORISES = {urlparse(url).netloc for url in SOURCES_AUTORISEES.values()}
  
 # ================= RESTRICTION RÉSEAU (MONKEY-PATCH) =================
-# ✅ FIX : Bloque toute requête vers un domaine non autorisé, au niveau de requests
-# Ceci s'applique à TOUTES les requêtes faites via requests.get / requests.post etc.
 _original_request = requests.Session.request
  
 def _restricted_request(self, method, url, **kwargs):
     """Intercepte chaque requête HTTP et bloque les domaines non autorisés."""
     domain = urlparse(url).netloc.split(":")[0]  # Retire le port si présent
     if domain not in DOMAINES_AUTORISES:
-        # On lève une exception claire plutôt que de retourner silencieusement ""
+        
         raise PermissionError(f"🚫 Requête bloquée : domaine '{domain}' non autorisé.")
     return _original_request(self, method, url, **kwargs)
  
@@ -51,8 +47,7 @@ requests.Session.request = _restricted_request
 # ================= FONCTIONS =================
 def fetch_content_from_url_safe(url):
     """Récupère le texte uniquement depuis les sites autorisés, limité à 3000 caractères."""
-    # ✅ FIX : La vérification de domaine est maintenant gérée par le monkey-patch,
-    # mais on garde ce check ici pour la lisibilité et la sécurité défensive
+    
     allowed_url = next(
         (allowed for allowed in SOURCES_AUTORISEES.values() if url.startswith(allowed)),
         None
