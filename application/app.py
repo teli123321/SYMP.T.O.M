@@ -104,19 +104,41 @@ def demander_ia(message):
     url = choisir_source(message)
     contenu = fetch_content_from_url_safe(url)
     
+    # 1. On ajoute le message de l'utilisateur à l'historique de session (pour l'affichage)
     st.session_state.conversation.append({"role": "user", "content": message})
     
-    messages_ia = [{"role": "system", "content": SYSTEM_PROMPT}]
-    ctx = f"Question: {message}\n\nSource ({url}):\n{contenu}" if contenu else message
-    messages_ia.append({"role": "user", "content": ctx})
+    # 2. Construction des messages pour l'API
+    messages_ia = [
+        {"role": "system", "content": SYSTEM_PROMPT},
+    ]
+
+    # Ajout de l'historique pour que l'IA se souvienne de la conversation
+    for msg in st.session_state.conversation[:-1]: # On prend tout sauf le dernier qu'on va formater après
+        messages_ia.append({"role": msg["role"], "content": msg["content"]})
+
+    # 3. LE RECADRAGE CRUCIAL : 
+    # On place la source dans un message séparé et on termine par une instruction de langue stricte.
+    instruction_contexte = f"Voici les informations de la source officielle ({url}) :\n{contenu if contenu else 'Aucune donnée trouvée.'}"
+    
+    messages_ia.append({"role": "system", "content": instruction_contexte})
+    
+    # On finit par la question de l'utilisateur avec un rappel d'ordre de langue
+    messages_ia.append({
+        "role": "user", 
+        "content": f"USER QUESTION: {message}\n\nIMPORTANT: Detect the language of 'USER QUESTION' and reply ONLY in that language. If it's English, reply in English. Si c'est en français, réponds en français."
+    })
 
     with st.spinner("💭 Analyse en cours..."):
-        resp = client.chat.completions.create(model="gpt-4o-mini", messages=messages_ia, temperature=TEMPERATURE)
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini", 
+            messages=messages_ia, 
+            temperature=0.1 # On baisse la température pour plus de rigueur
+        )
     
     reply = resp.choices[0].message.content
     source_name = next((k for k, v in SOURCES_AUTORISEES.items() if v == url), "Source")
+    
     st.session_state.conversation.append({"role": "assistant", "content": f"{reply}\n\n📌 *Source : {source_name}*"})
-
 # ================= CSS =================
 st.markdown("""
 <style>
